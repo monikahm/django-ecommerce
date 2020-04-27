@@ -1,5 +1,5 @@
 # Solan
-Solan Kiosk is a website made for Linjeforeningen Solan by Team Moser.  
+Solan Kiosk is a website made for Linjeforeningen Solan by Team Moser based on the django-eccommerce solution built by Matthew Freire.  
 
 ## Frameworks
 ### Frontend

@@ -15,6 +15,23 @@ import string
 import stripe
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
+import json
+from django.contrib.auth.models import User
+from oic import rndstr
+from oic.oauth2 import AuthorizationResponse, ResponseError
+from oic.oic import Client, RegistrationResponse
+from oic.utils.authn.client import CLIENT_AUTHN_METHOD
+import requests
+from urllib.parse import urlencode
+from django.contrib.auth import authenticate, login, logout
+
+
+DATAPORTEN_PROVIDER_CONFIG = 'https://auth.dataporten.no/'
+DATAPORTEN_CLIENT_ID = "e6b79299-66c2-4bf2-a1b8-dc19d332c120"
+DATAPORTEN_CLIENT_SECRET = "4bbb16d6-c8f8-407f-878b-29138868fa79"
+DATAPORTEN_REDIRECT_URI = "http://127.0.0.1:8000/callback"
+DATAPORTEN_SCOPES = ['userid-feide', 'userid', 'profile', 'groups', 'email', 'openid']
+
 
 def create_ref_code():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=20))
@@ -382,18 +399,18 @@ def add_to_cart(request, slug):
         if order.items.filter(item__slug=item.slug).exists():
             order_item.quantity += 1
             order_item.save()
-            messages.info(request, "This item quantity was updated.")
+            messages.info(request, "Mengden ble oppdatert.")
             return redirect("core:order-summary")
         else:
             order.items.add(order_item)
-            messages.info(request, "This item was added to your cart.")
+            messages.info(request, "Lagt til i handlevogn.")
             return redirect("core:order-summary")
     else:
         ordered_date = timezone.now()
         order = Order.objects.create(
             user=request.user, ordered_date=ordered_date)
         order.items.add(order_item)
-        messages.info(request, "This item was added to your cart.")
+        messages.info(request, "Lagt til i handlevogn")
         return redirect("core:order-summary")
 
 
@@ -415,13 +432,13 @@ def remove_from_cart(request, slug):
             )[0]
             order.items.remove(order_item)
             order_item.delete()
-            messages.info(request, "This item was removed from your cart.")
+            messages.info(request, "Fjernet fra handlevogn.")
             return redirect("core:order-summary")
         else:
-            messages.info(request, "This item was not in your cart")
+            messages.info(request, "Ikke i handlevogn")
             return redirect("core:product", slug=slug)
     else:
-        messages.info(request, "You do not have an active order")
+        messages.info(request, "Do har ingen aktiv ordre")
         return redirect("core:product", slug=slug)
 
 
@@ -446,13 +463,13 @@ def remove_single_item_from_cart(request, slug):
                 order_item.save()
             else:
                 order.items.remove(order_item)
-            messages.info(request, "This item quantity was updated.")
+            messages.info(request, "Mengden ble oppdatert")
             return redirect("core:order-summary")
         else:
-            messages.info(request, "This item was not in your cart")
+            messages.info(request, "Dette var ikke i handlevognen")
             return redirect("core:product", slug=slug)
     else:
-        messages.info(request, "You do not have an active order")
+        messages.info(request, "Du har ingen aktiv ordre")
         return redirect("core:product", slug=slug)
 
 
@@ -478,7 +495,7 @@ class AddCouponView(View):
                 messages.success(self.request, "Successfully added coupon")
                 return redirect("core:checkout")
             except ObjectDoesNotExist:
-                messages.info(self.request, "You do not have an active order")
+                messages.info(self.request, "Du har ingen aktiv ordre")
                 return redirect("core:checkout")
 
 
@@ -513,5 +530,146 @@ class RequestRefundView(View):
                 return redirect("core:request-refund")
 
             except ObjectDoesNotExist:
-                messages.info(self.request, "This order does not exist.")
+                messages.info(self.request, "Ordren eksisterer ikke.")
                 return redirect("core:request-refund")
+
+def client_setup(client_id, client_secret):
+    """Sets up an OpenID Connect Relying Party ("client") for connecting to Dataporten"""
+
+
+    assert client_id, 'Missing client id when setting up Dataporten OpenID Connect Relying Party'
+    assert client_secret, 'Missing client secret when setting up Dataporten OpenID Connect Relying Party'
+
+    client = Client(client_authn_method=CLIENT_AUTHN_METHOD)
+
+    client.provider_config(DATAPORTEN_PROVIDER_CONFIG)
+    client_args = {
+        'client_id': client_id,
+        'client_secret': client_secret,
+    }
+    client.store_registration_info(RegistrationResponse(**client_args))
+    return client
+
+def fetch_groups_information(access_token, show_all=False):
+    query_params = urlencode({
+        'show_all': show_all
+    })
+    groups_api = 'https://groups-api.dataporten.no/groups/me/groups?%s' % query_params
+    groups_resp = requests.request('GET', groups_api, headers={'Authorization': 'Bearer ' + access_token})
+
+    return json.loads(groups_resp.content.decode(encoding='UTF-8'))
+
+def approve_member(username, email, groups):
+    study_group = {}
+    for group in groups:
+        if group.get("id") == 'fc:adhoc:bddd4200-fa1c-40a4-86e2-a08cd1089cb6' or group.get("id") == 'fc:fs:fs:prg:ntnu.no:MENTRE':
+            study_group = group
+    if study_group:
+        user = User.objects.create_user(username, email, 'solan123')
+        return True
+    else:
+        return False
+
+def study(request):
+
+    client = client_setup(DATAPORTEN_CLIENT_ID, DATAPORTEN_CLIENT_SECRET)
+
+    # Generate random values used to verify that it's the same user when in the callback.
+    state = rndstr()
+    nonce = rndstr()
+
+    request.session['dataporten_study_state'] = state
+    request.session['dataporten_study_nonce'] = nonce
+
+    args = {
+        'client_id': DATAPORTEN_CLIENT_ID,
+        'response_type': 'code',
+        'scope': DATAPORTEN_SCOPES,
+        'redirect_uri': DATAPORTEN_REDIRECT_URI,
+        'nonce': nonce,
+        'state': state,
+    }
+
+    auth_req = client.construct_AuthorizationRequest(request_args=args)
+    login_url = auth_req.request(client.authorization_endpoint)
+
+    return redirect(login_url)
+
+def study_callback(request):
+
+    client = client_setup(DATAPORTEN_CLIENT_ID, DATAPORTEN_CLIENT_SECRET)
+
+    queryparams = request.GET.urlencode()
+
+    try:
+        auth_resp = client.parse_response(AuthorizationResponse, info=queryparams, sformat='urlencoded')
+    except ResponseError:
+        messages.error(
+            request, "Forespørselen mangler påkrevde felter, vennligst prøv igjen."
+        )
+        return redirect('http://127.0.0.1:8000')
+    if (
+            not request.session.get("dataporten_study_state", "")
+            or request.session["dataporten_study_state"] != auth_resp["state"]
+    ):
+        messages.error(
+            request, "Verifisering av forespørselen feilet. Vennligst prøv igjen."
+        )
+        return redirect('http://127.0.0.1:8000')
+
+    args = {
+        'code': auth_resp['code'],
+        'redirect_uri': DATAPORTEN_REDIRECT_URI,
+    }
+
+    token_request = client.do_access_token_request(
+        state=auth_resp['state'], request_args=args, authn_method='client_secret_basic',
+    )
+
+    access_token = token_request.get('access_token')
+
+
+    # Do user info request
+    userinfo = client.do_user_info_request(
+        state=auth_resp["state"], behavior="use_authorization_header"
+    )
+    ntnu_mail = userinfo.get("connect-userid_sec")[0].split(":")[1]
+    ntnu_username = (
+        userinfo.get("connect-userid_sec")[0].split(":")[1].split("@")[0]
+    )
+
+    # Getting information about study of the user
+    groups = fetch_groups_information(access_token)
+
+    user = authenticate(username=ntnu_username, password='solan123')
+    if user is not None:
+        login(request, user)
+        messages.success(
+            request,
+            "Du er nå logget inn og kan begynne å handle varer!"
+        )
+        return redirect('http://127.0.0.1:8000')
+    is_approved = approve_member(ntnu_username, ntnu_mail, groups)
+    if not is_approved:
+        messages.error(
+            request,
+            "Du er ikke medlem av Solan linjeforening"
+        )
+
+        return redirect('http://127.0.0.1:8000')
+    if is_approved:
+        user = authenticate(username=ntnu_username, password='solan123')
+        if user is not None:
+            login(request, user)
+            messages.success(
+                request,
+                "Du er nå logget inn og kan begynne å handle varer!"
+            )
+            return redirect('http://127.0.0.1:8000')
+    messages.error(request,"Noe gikk galt, prøv igjen")
+    return redirect('http://127.0.0.1:8000')
+
+def logout_view(request):
+    logout(request)
+    messages.success(request, "Du er nå logget ut av kiosken.")
+    return redirect('core:home')
